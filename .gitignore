@@ -1,0 +1,10 @@
+# build outputs / deps
+node_modules/
+dist/
+dist_backend/
+__pycache__/
+*.pyc
+*.spec.bak
+
+# PyInstaller intermediates (keep build/icon.* source assets)
+build/*/
