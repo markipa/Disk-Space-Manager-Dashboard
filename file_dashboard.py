@@ -1114,9 +1114,9 @@ app.layout = html.Div(
                                                    "backgroundColor": "#ED553B"}),
                             ],
                         ),
-                        # table (grows to fill; details panel sits below)
+                        # table (grows to fill and scrolls; details sits below)
                         html.Div(
-                            style=dict(flex="1", minHeight="0", overflow="hidden"),
+                            style=dict(flex="1", minHeight="0", overflowY="auto"),
                             children=dash_table.DataTable(
                                 id="table",
                                 columns=[
@@ -1135,7 +1135,7 @@ app.layout = html.Div(
                                 row_selectable="multi",
                                 selected_rows=[],
                                 sort_action="native",
-                                style_table=dict(height="100%", overflowY="auto"),
+                                style_table=dict(overflowY="auto"),
                                 style_cell_conditional=[
                                     dict(if_=dict(column_id="name"), width="34%"),
                                     dict(if_=dict(column_id="size"), width="15%"),
