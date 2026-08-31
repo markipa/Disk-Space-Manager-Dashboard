@@ -29,7 +29,9 @@ Requires: dash, plotly  (see requirements.txt)
 import os
 import sys
 import math
+import time
 import heapq
+import hashlib
 import datetime
 import threading
 import subprocess
@@ -51,6 +53,7 @@ if "--pick-folder" in sys.argv:
 import plotly.graph_objects as go
 from send2trash import send2trash
 from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx, no_update
+from dash.dash_table.Format import Format, Scheme
 
 
 # ----------------------------- palette ------------------------------------- #
@@ -104,6 +107,15 @@ def _trim(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def mask_name(name: str, is_dir: bool, privacy: bool) -> str:
+    """Privacy mode: hide the name but keep a file's extension so type reads."""
+    if not privacy:
+        return name
+    if is_dir:
+        return "•••••"
+    return "•••••" + os.path.splitext(name)[1]
+
+
 @dataclass
 class Item:
     """One file or folder plus its total size in bytes and modified time."""
@@ -123,6 +135,16 @@ def fmt_date(ts: float) -> str:
         return datetime.datetime.fromtimestamp(ts).strftime("%d %b %Y")
     except (OSError, OverflowError, ValueError):
         return "—"
+
+
+def fmt_iso(ts: float) -> str:
+    """Epoch seconds -> '2026-08-23' (sortable in the table); '' when unknown."""
+    if not ts:
+        return ""
+    try:
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    except (OSError, OverflowError, ValueError):
+        return ""
 
 
 # ----------------------------- scanner ------------------------------------- #
@@ -259,7 +281,8 @@ def empty_fig(msg="Select a folder to begin", th=THEMES["dark"]):
     return fig
 
 
-def build_hierarchy(item: Item, max_nodes: int = 700, max_depth: int = 6):
+def build_hierarchy(item: Item, max_nodes: int = 700, max_depth: int = 6,
+                    privacy: bool = False):
     """
     Flatten `item`'s subtree into the parallel arrays Plotly's treemap/sunburst
     want (ids/labels/parents/values/customdata), plus a per-node colour value.
@@ -275,7 +298,7 @@ def build_hierarchy(item: Item, max_nodes: int = 700, max_depth: int = 6):
     Returns (ids, labels, parents, values, custom, node_colors).
     """
     ids = [item.path]
-    labels = [item.name]
+    labels = [mask_name(item.name, True, privacy)]
     parents = [""]
     values = [item.size]
     custom = [["Folder", human_size(item.size), ""]]
@@ -290,7 +313,7 @@ def build_hierarchy(item: Item, max_nodes: int = 700, max_depth: int = 6):
     while heap and len(ids) < max_nodes:
         _, _, node, parent_path, depth = heapq.heappop(heap)
         ids.append(node.path)
-        labels.append(node.name)
+        labels.append(mask_name(node.name, node.is_dir, privacy))
         parents.append(parent_path)
         values.append(node.size)
         kind = "Folder" if node.is_dir else "File"
@@ -335,7 +358,7 @@ def build_hierarchy(item: Item, max_nodes: int = 700, max_depth: int = 6):
     return ids, labels, parents, values, custom, node_colors
 
 
-def treemap_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
+def treemap_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
     """
     Hierarchical treemap of the current folder's subtree. Click a tile to zoom
     in, click the header (pathbar) to zoom back out. Colour = size vs. siblings
@@ -343,7 +366,8 @@ def treemap_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
     """
     if not item.children:
         return empty_fig("Empty folder", th)
-    ids, labels, parents, values, custom, node_colors = build_hierarchy(item)
+    ids, labels, parents, values, custom, node_colors = build_hierarchy(
+        item, privacy=privacy)
 
     fig = go.Figure(go.Treemap(
         ids=ids,
@@ -392,7 +416,7 @@ def treemap_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
     return fig
 
 
-def sunburst_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
+def sunburst_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
     """
     Radial hierarchy of the current folder's subtree. Rings = depth, angle =
     size; click a wedge to zoom in, click the centre to zoom out. Same data and
@@ -400,7 +424,8 @@ def sunburst_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
     """
     if not item.children:
         return empty_fig("Empty folder", th)
-    ids, labels, parents, values, custom, node_colors = build_hierarchy(item)
+    ids, labels, parents, values, custom, node_colors = build_hierarchy(
+        item, privacy=privacy)
 
     fig = go.Figure(go.Sunburst(
         ids=ids,
@@ -541,13 +566,13 @@ def open_in_explorer(path: str) -> bool:
         return False
 
 
-def bar_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
+def bar_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
     """Horizontal bar of the biggest items, same size colour scale."""
     kids = sorted(item.children, key=lambda c: c.size, reverse=True)[:15]
     if not kids:
         return empty_fig("Empty folder", th)
     kids = kids[::-1]  # biggest on top
-    names = [_trim(c.name, 30) for c in kids]
+    names = [_trim(mask_name(c.name, c.is_dir, privacy), 30) for c in kids]
     values = [c.size for c in kids]
     labels = [human_size(c.size) for c in kids]
 
@@ -570,6 +595,120 @@ def bar_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
         bargap=0.25,
     )
     return fig
+
+
+# Age buckets: (label, upper bound in days). Files land in the first bucket
+# whose bound they're within; the last bucket catches everything older.
+AGE_BUCKETS = [
+    ("Today", 1), ("≤ 7 days", 7), ("≤ 30 days", 30), ("≤ 90 days", 90),
+    ("≤ 6 months", 182), ("≤ 1 year", 365), ("1–3 years", 1095),
+    ("> 3 years", math.inf),
+]
+
+
+def age_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
+    """Bar of total file size by modified-age bucket (older = warmer colour)."""
+    now = time.time()
+    sizes = [0] * len(AGE_BUCKETS)
+    counts = [0] * len(AGE_BUCKETS)
+    stack = [item]
+    while stack:
+        cur = stack.pop()
+        for c in cur.children:
+            if c.is_dir:
+                stack.append(c)
+                continue
+            age_days = (now - c.mtime) / 86400.0 if c.mtime else math.inf
+            for i, (_, bound) in enumerate(AGE_BUCKETS):
+                if age_days <= bound:
+                    sizes[i] += c.size
+                    counts[i] += 1
+                    break
+    if not any(sizes):
+        return empty_fig("No files", th)
+
+    labels = [b[0] for b in AGE_BUCKETS]
+    colours = [i / (len(AGE_BUCKETS) - 1) for i in range(len(AGE_BUCKETS))]
+    text = [human_size(s) if s else "" for s in sizes]
+    fig = go.Figure(go.Bar(
+        x=labels, y=sizes,
+        marker=dict(color=colours, colorscale=COLOR_SCALE, cmin=0, cmax=1,
+                    line=dict(width=0)),
+        text=text, textposition="outside",
+        customdata=[[human_size(s), n] for s, n in zip(sizes, counts)],
+        hovertemplate=("<b>%{x}</b><br>%{customdata[0]} · "
+                       "%{customdata[1]} files<extra></extra>"),
+    ))
+    fig.update_layout(
+        **base_layout(th),
+        title=dict(text="Storage by file age  (older → warmer)",
+                   font=dict(size=15)),
+        xaxis=dict(showgrid=False),
+        yaxis=dict(showgrid=True, gridcolor=th["grid"], zeroline=False,
+                   tickvals=[], title=""),
+        bargap=0.3,
+    )
+    return fig
+
+
+# ----------------------------- duplicates ---------------------------------- #
+
+def _file_hash(path: str, full: bool = False) -> str | None:
+    """SHA-1 of a file: first 64 KB (quick) or the whole file (full)."""
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            if full:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            else:
+                h.update(f.read(65536))
+        return h.hexdigest()
+    except (OSError, PermissionError):
+        return None
+
+
+def find_duplicates(item: Item, min_size: int = 1_048_576) -> list[list[Item]]:
+    """
+    Find groups of byte-identical files at/under `item` (size >= min_size).
+
+    Staged for performance: bucket by exact size, then by a 64 KB quick hash,
+    then confirm with a full hash. Returns groups (>= 2 files) sorted by wasted
+    space (size * (copies - 1)) descending.
+    """
+    by_size: dict[int, list[Item]] = {}
+    stack = [item]
+    while stack:
+        cur = stack.pop()
+        for c in cur.children:
+            if c.is_dir:
+                stack.append(c)
+            elif c.size >= min_size:
+                by_size.setdefault(c.size, []).append(c)
+
+    groups: list[list[Item]] = []
+    for size, items in by_size.items():
+        if len(items) < 2:
+            continue
+        by_quick: dict[str, list[Item]] = {}
+        for it in items:
+            qh = _file_hash(it.path, full=False)
+            if qh is not None:
+                by_quick.setdefault(qh, []).append(it)
+        for quick_group in by_quick.values():
+            if len(quick_group) < 2:
+                continue
+            by_full: dict[str, list[Item]] = {}
+            for it in quick_group:
+                fh = _file_hash(it.path, full=True)
+                if fh is not None:
+                    by_full.setdefault(fh, []).append(it)
+            for full_group in by_full.values():
+                if len(full_group) >= 2:
+                    groups.append(full_group)
+
+    groups.sort(key=lambda g: g[0].size * (len(g) - 1), reverse=True)
+    return groups
 
 
 # ----------------------------- app / layout -------------------------------- #
@@ -638,6 +777,71 @@ def _tab(selected=False):
     return base
 
 
+def dupes_tab():
+    """Duplicates tab: controls + a results table (populated on demand)."""
+    return html.Div(
+        style=dict(height=CHART_H, display="flex", flexDirection="column",
+                   padding="4px"),
+        children=[
+            html.Div(
+                style=dict(display="flex", gap="8px", alignItems="center",
+                           marginBottom="8px", flexWrap="wrap"),
+                children=[
+                    html.Button("🔎  Find duplicates", id="dupe-btn",
+                                n_clicks=0,
+                                style={**BTN_STYLE, "padding": "8px 14px",
+                                       "fontSize": "13px"}),
+                    dcc.Dropdown(
+                        id="dupe-min", clearable=False, value=1_048_576,
+                        options=[
+                            {"label": "≥ 100 KB", "value": 102_400},
+                            {"label": "≥ 1 MB", "value": 1_048_576},
+                            {"label": "≥ 10 MB", "value": 10_485_760},
+                            {"label": "≥ 100 MB", "value": 104_857_600},
+                        ],
+                        style=dict(width="130px", fontSize="13px"),
+                    ),
+                    html.Div(id="dupe-summary",
+                             style=dict(color="var(--muted)", fontSize="13px")),
+                ],
+            ),
+            dcc.Loading(
+                type="circle", color="#3a7ebf",
+                children=dash_table.DataTable(
+                    id="dupe-table",
+                    columns=[
+                        dict(name="File", id="name"),
+                        dict(name="Size each", id="size"),
+                        dict(name="Copies", id="copies"),
+                        dict(name="Wasted", id="wasted"),
+                        dict(name="Locations", id="locations"),
+                    ],
+                    data=[],
+                    page_size=100,
+                    style_table=dict(flex="1", overflowY="auto",
+                                     height="calc(100vh - 340px)"),
+                    style_header=dict(backgroundColor="var(--head)",
+                                      color="var(--fg)", fontWeight="700",
+                                      border="none"),
+                    style_cell=dict(backgroundColor="var(--panel)",
+                                    color="var(--fg)", border="none",
+                                    padding="6px 10px", fontSize="13px",
+                                    textAlign="left", maxWidth=0,
+                                    overflow="hidden", textOverflow="ellipsis"),
+                    style_cell_conditional=[
+                        dict(if_=dict(column_id="size"), textAlign="right",
+                             width="14%"),
+                        dict(if_=dict(column_id="copies"), textAlign="center",
+                             width="9%"),
+                        dict(if_=dict(column_id="wasted"), textAlign="right",
+                             width="12%"),
+                    ],
+                ),
+            ),
+        ],
+    )
+
+
 app.layout = html.Div(
     style=dict(backgroundColor="var(--bg)", color="var(--fg)", height="100vh",
                boxSizing="border-box", overflow="hidden", display="flex",
@@ -648,6 +852,7 @@ app.layout = html.Div(
         dcc.Store(id="refresh", data=0),
         dcc.Store(id="pending-delete"),
         dcc.Store(id="theme", data="dark"),
+        dcc.Store(id="privacy", data=False),
         dcc.ConfirmDialog(id="confirm-del"),
         dcc.Interval(id="scan-poll", interval=300, disabled=True),
         html.Div(
@@ -668,6 +873,8 @@ app.layout = html.Div(
                                     textOverflow="ellipsis", maxWidth="420px")),
                 html.Button("✖  Cancel", id="cancel-btn", n_clicks=0,
                             style=CANCEL_HIDDEN),
+                html.Button("🕶  Hide names", id="privacy-btn", n_clicks=0,
+                            style={**BTN_STYLE, "backgroundColor": "#666"}),
                 html.Button("◐  Light / Dark", id="theme-btn", n_clicks=0,
                             style={**BTN_STYLE, "backgroundColor": "#666"}),
             ],
@@ -721,6 +928,15 @@ app.layout = html.Div(
                                         id="filetype", figure=empty_fig(),
                                         responsive=True,
                                         style=dict(height=CHART_H))),
+                            dcc.Tab(label="File Age", value="age",
+                                    style=_tab(), selected_style=_tab(True),
+                                    children=dcc.Graph(
+                                        id="agechart", figure=empty_fig(),
+                                        responsive=True,
+                                        style=dict(height=CHART_H))),
+                            dcc.Tab(label="Duplicates", value="dupes",
+                                    style=_tab(), selected_style=_tab(True),
+                                    children=dupes_tab()),
                         ],
                     ),
                 ),
@@ -731,8 +947,9 @@ app.layout = html.Div(
                                minHeight="0"),
                     children=[
                         html.Div(
-                            "Largest items — click a folder name to open; "
-                            "use the radio to pick a target for the buttons.",
+                            "Largest items — click a folder name to open; tick "
+                            "rows to target the buttons; click headers to sort. "
+                            "Type in search to look through all subfolders.",
                             style=dict(fontWeight="700", padding="6px 4px",
                                        fontSize="13px")),
                         # search + filters
@@ -741,7 +958,8 @@ app.layout = html.Div(
                                        margin="2px 4px 8px", alignItems="center"),
                             children=[
                                 dcc.Input(id="search", type="text", debounce=True,
-                                          placeholder="🔍  Search name…",
+                                          placeholder="🔍  Search all subfolders "
+                                          "(name or .ext)…",
                                           style={**INPUT_STYLE, "flex": "1"}),
                                 dcc.Dropdown(
                                     id="minsize", clearable=False, value=0,
@@ -792,14 +1010,17 @@ app.layout = html.Div(
                                 columns=[
                                     dict(name="Name", id="name"),
                                     dict(name="Size", id="size"),
-                                    dict(name="%", id="pct"),
+                                    dict(name="%", id="pct", type="numeric",
+                                         format=Format(precision=1,
+                                                       scheme=Scheme.percentage)),
                                     dict(name="Modified", id="modified"),
                                     dict(name="Type", id="type"),
                                 ],
                                 data=[],
                                 page_size=200,
-                                row_selectable="single",
+                                row_selectable="multi",
                                 selected_rows=[],
+                                sort_action="native",
                                 style_table=dict(height="100%", overflowY="auto"),
                                 style_cell_conditional=[
                                     dict(if_=dict(column_id="name"), width="34%"),
@@ -868,6 +1089,18 @@ app.clientside_callback(
 )
 
 
+# Privacy mode: hide file/folder names across table, charts, cards, details.
+@app.callback(
+    Output("privacy", "data"),
+    Output("privacy-btn", "children"),
+    Input("privacy-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def toggle_privacy(n):
+    on = (n or 0) % 2 == 1
+    return on, ("🙈  Names hidden" if on else "🕶  Hide names")
+
+
 # ----------------------------- callbacks ----------------------------------- #
 
 # ---- Start a scan (native folder picker -> background thread + polling) ---- #
@@ -931,10 +1164,10 @@ def cancel_scan_cb(_n):
     Input("up", "n_clicks"),
     Input("table", "active_cell"),
     State("current-path", "data"),
-    State("table", "data"),
+    State("table", "derived_viewport_data"),   # sorted/filtered view (row maps here)
     prevent_initial_call=True,
 )
-def navigate(_u, active_cell, cur_path, table_data):
+def navigate(_u, active_cell, cur_path, view_data):
     trigger = ctx.triggered_id
 
     if trigger == "up":
@@ -943,14 +1176,13 @@ def navigate(_u, active_cell, cur_path, table_data):
         parent = os.path.dirname(cur_path)
         return parent if parent in INDEX else no_update
 
-    if trigger == "table" and active_cell and table_data:
-        # only a click on the Name column drills in (radio handles selection)
+    if trigger == "table" and active_cell and view_data:
         if active_cell.get("column_id") != "name":
             return no_update
         row = active_cell.get("row")
-        if row is None or row >= len(table_data):
+        if row is None or row >= len(view_data):
             return no_update
-        path = table_data[row].get("path")
+        path = view_data[row].get("path")
         node = INDEX.get(path)
         if node and node.is_dir and node.children:
             return path
@@ -959,21 +1191,13 @@ def navigate(_u, active_cell, cur_path, table_data):
     return no_update
 
 
-def selected_item(cur_path, selected_rows, table_data) -> Item | None:
-    """Resolve the table's selected radio row to its Item (matched by path)."""
-    if not selected_rows or not table_data:
-        return None
-    i = selected_rows[0]
-    if i >= len(table_data):
-        return None
+def selected_items(cur_path, sel_rows, view_data) -> list[Item]:
+    """Resolve the table's ticked rows to their Items (matched by path)."""
     node = INDEX.get(cur_path)
-    if not node:
-        return None
-    path = table_data[i].get("path")
-    for c in node.children:
-        if c.path == path:
-            return c
-    return None
+    if not node or not sel_rows or not view_data:
+        return []
+    paths = {view_data[i].get("path") for i in sel_rows if i < len(view_data)}
+    return [c for c in node.children if c.path in paths]
 
 
 @app.callback(
@@ -986,19 +1210,21 @@ def selected_item(cur_path, selected_rows, table_data) -> Item | None:
     Output("sunburst", "figure"),
     Output("bar", "figure"),
     Output("filetype", "figure"),
+    Output("agechart", "figure"),
     Output("footer", "children"),
     Input("current-path", "data"),
     Input("refresh", "data"),
     Input("theme", "data"),
+    Input("privacy", "data"),
     prevent_initial_call=True,
 )
-def render(cur_path, _refresh, theme_name):
+def render(cur_path, _refresh, theme_name, privacy):
     th = theme(theme_name)
     node = INDEX.get(cur_path) if cur_path else None
     if not node:
         return ("—", "—", "—", "—", "No folder selected",
                 empty_fig(th=th), empty_fig(th=th), empty_fig(th=th),
-                empty_fig(th=th), "Ready.")
+                empty_fig(th=th), empty_fig(th=th), "Ready.")
 
     # counts across subtree
     files = dirs = 0
@@ -1015,14 +1241,17 @@ def render(cur_path, _refresh, theme_name):
     biggest_txt = "—"
     if node.children:
         b = max(node.children, key=lambda c: c.size)
-        biggest_txt = f"{_trim(b.name, 20)}\n{human_size(b.size)}"
+        biggest_txt = (f"{_trim(mask_name(b.name, b.is_dir, privacy), 20)}\n"
+                       f"{human_size(b.size)}")
 
-    footer = (f"{cur_path}  —  {len(node.children)} items, "
+    shown_path = "🔒  path hidden" if privacy else cur_path
+    footer = (f"{shown_path}  —  {len(node.children)} items, "
               f"{human_size(node.size)} total")
 
     return (human_size(node.size), f"{files:,}", f"{dirs:,}", biggest_txt,
-            cur_path, treemap_fig(node, th), sunburst_fig(node, th),
-            bar_fig(node, th), filetype_fig(node, th=th), footer)
+            shown_path, treemap_fig(node, th, privacy),
+            sunburst_fig(node, th, privacy), bar_fig(node, th, privacy),
+            filetype_fig(node, th=th), age_fig(node, th), footer)
 
 
 # ---- Table: filtered/searched list of the current folder's children ---- #
@@ -1033,9 +1262,10 @@ def render(cur_path, _refresh, theme_name):
     Input("search", "value"),
     Input("minsize", "value"),
     Input("kind", "value"),
+    Input("privacy", "data"),
     prevent_initial_call=True,
 )
-def fill_table(cur_path, _refresh, search, minsize, kind):
+def fill_table(cur_path, _refresh, search, minsize, kind, privacy):
     node = INDEX.get(cur_path) if cur_path else None
     if not node:
         return []
@@ -1045,9 +1275,27 @@ def fill_table(cur_path, _refresh, search, minsize, kind):
         mn = int(minsize or 0)
     except (TypeError, ValueError):
         mn = 0
-    rows = []
-    for c in sorted(node.children, key=lambda c: c.size, reverse=True):
-        if q and q not in c.name.lower():
+
+    # With a search term, look through the WHOLE subtree (so you can find a file
+    # or extension buried in any subfolder); otherwise list this folder's own
+    # children. Recursive results are capped and sorted by size.
+    if q:
+        candidates = []
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            for c in cur.children:
+                candidates.append(c)
+                if c.is_dir:
+                    stack.append(c)
+        limit = 1000
+    else:
+        candidates = node.children
+        limit = None
+
+    matched = []
+    for c in candidates:
+        if q and q not in c.name.lower():   # search matches the real name
             continue
         if c.size < mn:
             continue
@@ -1055,10 +1303,26 @@ def fill_table(cur_path, _refresh, search, minsize, kind):
             continue
         if kind == "folders" and not c.is_dir:
             continue
+        matched.append(c)
+
+    matched.sort(key=lambda c: c.size, reverse=True)
+    if limit:
+        matched = matched[:limit]
+
+    rel_from = os.path.dirname(node.path)     # show where a hit lives, when searching
+    rows = []
+    for c in matched:
+        display = mask_name(c.name, c.is_dir, privacy)
+        if q and not privacy:
+            parent = os.path.dirname(c.path)
+            if parent and parent != node.path:
+                sub = os.path.relpath(parent, rel_from)
+                display = f"{display}   ·   {sub}"
         rows.append(dict(
-            name=c.name, size=human_size(c.size),
-            pct=f"{100.0 * c.size / total:.1f}%",
-            modified=fmt_date(c.mtime),
+            name=display,
+            size=human_size(c.size),
+            pct=c.size / total,                 # fraction -> percentage format
+            modified=fmt_iso(c.mtime),          # ISO so the column sorts by date
             type="Folder" if c.is_dir else "File",
             path=c.path,          # hidden: used for selection + drill-in
         ))
@@ -1068,18 +1332,29 @@ def fill_table(cur_path, _refresh, search, minsize, kind):
 # ---- Selected-item details panel ---- #
 @app.callback(
     Output("details", "children"),
-    Input("table", "selected_rows"),
+    Input("table", "derived_virtual_selected_rows"),
     Input("current-path", "data"),
-    State("table", "data"),
-    State("theme", "data"),
+    Input("privacy", "data"),
+    State("table", "derived_virtual_data"),
     prevent_initial_call=True,
 )
-def show_details(selected_rows, cur_path, table_data, theme_name):
-    item = selected_item(cur_path, selected_rows, table_data)
-    if not item:
-        return html.Div("Select a row to see details.",
+def show_details(sel_rows, cur_path, privacy, view_data):
+    items = selected_items(cur_path, sel_rows, view_data)
+    if not items:
+        return html.Div("Select one or more rows to see details.",
                         style=dict(color="var(--muted)", fontSize="13px",
                                    padding="10px 4px"))
+    if len(items) > 1:
+        total = sum(i.size for i in items)
+        return html.Div([
+            html.Div(f"{len(items)} items selected",
+                     style=dict(fontWeight="700", fontSize="14px",
+                                marginBottom="6px")),
+            html.Div(f"Combined size: {human_size(total)}",
+                     style=dict(fontSize="13px", color="var(--muted)")),
+        ])
+
+    item = items[0]
 
     def row(label, value):
         return html.Div(
@@ -1092,55 +1367,63 @@ def show_details(selected_rows, cur_path, table_data, theme_name):
 
     kind = "Folder" if item.is_dir else (
         (os.path.splitext(item.name)[1].lstrip(".").upper() or "File") + " file")
+    disp_name = mask_name(item.name, item.is_dir, privacy)
+    disp_path = "🔒  hidden" if privacy else item.path
     return html.Div([
-        html.Div(_trim(item.name, 60),
+        html.Div(_trim(disp_name, 60),
                  style=dict(fontWeight="700", fontSize="14px",
                             marginBottom="6px", wordBreak="break-all")),
         row("Size", human_size(item.size)),
         row("Modified", fmt_date(item.mtime)),
         row("Type", kind),
-        row("Path", item.path),
+        row("Path", disp_path),
     ])
 
 
-# ---- Open in Explorer ---- #
+# ---- Open in Explorer (first selected) ---- #
 @app.callback(
     Output("footer", "children", allow_duplicate=True),
     Input("open-btn", "n_clicks"),
     State("current-path", "data"),
-    State("table", "selected_rows"),
-    State("table", "data"),
+    State("table", "derived_virtual_selected_rows"),
+    State("table", "derived_virtual_data"),
     prevent_initial_call=True,
 )
-def open_selected(_n, cur_path, selected_rows, table_data):
-    item = selected_item(cur_path, selected_rows, table_data)
-    if not item:
-        return "Select a row (radio button) first, then click Open."
-    ok = open_in_explorer(item.path)
-    return (f"Opened in Explorer: {item.path}" if ok
-            else f"Could not open: {item.path}")
+def open_selected(_n, cur_path, sel_rows, view_data):
+    items = selected_items(cur_path, sel_rows, view_data)
+    if not items:
+        return "Tick a row first, then click Open."
+    ok = open_in_explorer(items[0].path)
+    return (f"Opened in Explorer: {items[0].path}" if ok
+            else f"Could not open: {items[0].path}")
 
 
-# ---- Delete: step 1, ask for confirmation ---- #
+# ---- Delete: step 1, ask for confirmation (supports multi-select) ---- #
 @app.callback(
     Output("confirm-del", "displayed"),
     Output("confirm-del", "message"),
     Output("pending-delete", "data"),
     Input("del-btn", "n_clicks"),
     State("current-path", "data"),
-    State("table", "selected_rows"),
-    State("table", "data"),
+    State("table", "derived_virtual_selected_rows"),
+    State("table", "derived_virtual_data"),
     prevent_initial_call=True,
 )
-def ask_delete(_n, cur_path, selected_rows, table_data):
-    item = selected_item(cur_path, selected_rows, table_data)
-    if not item:
-        return True, "Select a row (radio button) first, then click Delete.", None
-    kind = "folder" if item.is_dir else "file"
-    msg = (f"Send this {kind} to the Recycle Bin?\n\n"
-           f"{item.name}\n{human_size(item.size)}\n\n{item.path}\n\n"
-           f"(Reversible — you can restore it from the Recycle Bin.)")
-    return True, msg, item.path
+def ask_delete(_n, cur_path, sel_rows, view_data):
+    items = selected_items(cur_path, sel_rows, view_data)
+    if not items:
+        return True, "Tick one or more rows first, then click Delete.", None
+    total = sum(i.size for i in items)
+    if len(items) == 1:
+        it = items[0]
+        head = f"Send this {'folder' if it.is_dir else 'file'} to the Recycle Bin?"
+        body = f"{it.name}\n{human_size(it.size)}\n\n{it.path}"
+    else:
+        head = f"Send {len(items)} items to the Recycle Bin?"
+        body = f"Combined size: {human_size(total)}"
+    msg = (f"{head}\n\n{body}\n\n"
+           f"(Reversible — you can restore them from the Recycle Bin.)")
+    return True, msg, [i.path for i in items]
 
 
 # ---- Delete: step 2, user confirmed ---- #
@@ -1153,15 +1436,58 @@ def ask_delete(_n, cur_path, selected_rows, table_data):
     State("refresh", "data"),
     prevent_initial_call=True,
 )
-def do_delete(_submit, path, refresh):
-    if not path:
+def do_delete(_submit, paths, refresh):
+    if not paths:
         return no_update, no_update, no_update
-    try:
-        send2trash(os.path.normpath(path))
-    except Exception as e:
-        return no_update, f"Delete failed: {e}", no_update
-    remove_item(path)
-    return (refresh or 0) + 1, f"Sent to Recycle Bin: {path}", []
+    if isinstance(paths, str):
+        paths = [paths]
+    ok, failed = 0, []
+    for p in paths:
+        try:
+            send2trash(os.path.normpath(p))
+            remove_item(p)
+            ok += 1
+        except Exception as e:                   # noqa: BLE001
+            failed.append(f"{os.path.basename(p)}: {e}")
+    msg = f"Sent {ok} item(s) to Recycle Bin."
+    if failed:
+        msg += "  Failed: " + "; ".join(failed[:3])
+    return (refresh or 0) + 1, msg, []
+
+
+# ---- Duplicate finder (on demand) ---- #
+@app.callback(
+    Output("dupe-table", "data"),
+    Output("dupe-summary", "children"),
+    Input("dupe-btn", "n_clicks"),
+    State("current-path", "data"),
+    State("dupe-min", "value"),
+    State("privacy", "data"),
+    prevent_initial_call=True,
+)
+def find_dupes_cb(_n, cur_path, min_size, privacy):
+    node = INDEX.get(cur_path) if cur_path else None
+    if not node:
+        return [], "Scan a folder first."
+    groups = find_duplicates(node, int(min_size or 1_048_576))
+    if not groups:
+        return [], "No duplicate files found in this folder."
+    wasted_total = sum(g[0].size * (len(g) - 1) for g in groups)
+    rows = []
+    for g in groups[:500]:
+        rep = g[0]
+        locs = ("🔒 hidden" if privacy
+                else "   |   ".join(os.path.dirname(x.path) for x in g))
+        rows.append(dict(
+            name=mask_name(rep.name, False, privacy),
+            size=human_size(rep.size),
+            copies=len(g),
+            wasted=human_size(rep.size * (len(g) - 1)),
+            locations=locs,
+        ))
+    summary = (f"⚠ {len(groups):,} duplicate set(s) · potential savings "
+               f"{human_size(wasted_total)}")
+    return rows, summary
 
 
 if __name__ == "__main__":
