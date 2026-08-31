@@ -19,11 +19,24 @@ for pkg in (
     except Exception:
         pass
 
+# Pillow (icon rendering) — collect its data/binaries too.
+for pkg in ("PIL",):
+    try:
+        d, b, h = collect_all(pkg)
+        datas += d
+        binaries += b
+        hiddenimports += h
+    except Exception:
+        pass
+
 # tkinter is only imported inside the --pick-folder branch; pythonnet/clr power
-# the Windows WebView2 backend of pywebview — name them explicitly.
+# the Windows WebView2 backend of pywebview; win32gui/win32ui extract the shell
+# icons — name them explicitly.
 hiddenimports += [
     "tkinter", "tkinter.filedialog",
     "pythonnet", "clr", "clr_loader", "webview.platforms.edgechromium",
+    "win32gui", "win32ui", "win32con", "pywintypes",
+    "PIL.Image",
 ]
 
 a = Analysis(
@@ -38,7 +51,7 @@ a = Analysis(
     # Plotly graph_objects serialized to JSON — no scipy/pandas/numba needed.
     excludes=[
         "matplotlib", "scipy", "pandas", "numba", "llvmlite",
-        "lxml", "IPython", "PIL", "PyQt5", "PySide2", "PySide6",
+        "lxml", "IPython", "PyQt5", "PySide2", "PySide6",
         "notebook", "pyarrow", "sqlalchemy", "tables", "sympy",
     ],
     noarchive=False,

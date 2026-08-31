@@ -31,11 +31,16 @@ import sys
 import math
 import time
 import heapq
+import base64
 import hashlib
 import datetime
 import threading
 import subprocess
 from dataclasses import dataclass, field
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
 
 # Folder-picker child process: handled before the (heavier) Dash imports so the
 # dialog pops instantly. See pick_folder_dialog().
@@ -114,6 +119,101 @@ def mask_name(name: str, is_dir: bool, privacy: bool) -> str:
     if is_dir:
         return "•••••"
     return "•••••" + os.path.splitext(name)[1]
+
+
+# ------------------------- Windows shell icons ----------------------------- #
+# The real Explorer icon for each file type, extracted once per extension and
+# cached as PNG bytes. Served as same-origin URLs (/icon/<key>) because the
+# DataTable markdown renderer blocks data: image URIs. Windows only.
+
+_ICON_PNG: dict[str, bytes] = {}     # key -> png bytes (b"" if no icon)
+
+
+if sys.platform == "win32":
+    class _SHFILEINFO(ctypes.Structure):
+        _fields_ = [
+            ("hIcon", wintypes.HICON),
+            ("iIcon", ctypes.c_int),
+            ("dwAttributes", wintypes.DWORD),
+            ("szDisplayName", wintypes.WCHAR * 260),
+            ("szTypeName", wintypes.WCHAR * 80),
+        ]
+
+
+def _extract_icon_png(dummy_name: str, is_dir: bool) -> bytes:
+    import io
+    import win32gui
+    import win32ui
+    from PIL import Image
+
+    FILE_ATTRIBUTE_DIRECTORY = 0x10
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    SHGFI_ICON = 0x000000100
+    SHGFI_SMALLICON = 0x000000001
+    SHGFI_USEFILEATTRIBUTES = 0x000000010
+
+    info = _SHFILEINFO()
+    attrs = FILE_ATTRIBUTE_DIRECTORY if is_dir else FILE_ATTRIBUTE_NORMAL
+    flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES
+    res = ctypes.windll.shell32.SHGetFileInfoW(
+        dummy_name, attrs, ctypes.byref(info), ctypes.sizeof(info), flags)
+    hicon = info.hIcon
+    if not res or not hicon:
+        return b""
+
+    size = 16
+    screen = memdc = hdc = None
+    try:
+        screen = win32gui.GetDC(0)
+        hdc = win32ui.CreateDCFromHandle(screen)
+        hbmp = win32ui.CreateBitmap()
+        hbmp.CreateCompatibleBitmap(hdc, size, size)
+        memdc = hdc.CreateCompatibleDC()
+        memdc.SelectObject(hbmp)
+        memdc.DrawIcon((0, 0), hicon)
+        bits = hbmp.GetBitmapBits(True)
+        img = Image.frombuffer("RGBA", (size, size), bits, "raw", "BGRA", 0, 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    finally:
+        try:
+            ctypes.windll.user32.DestroyIcon(hicon)
+            if memdc:
+                memdc.DeleteDC()
+            if hdc:
+                hdc.DeleteDC()
+            if screen:
+                win32gui.ReleaseDC(0, screen)
+        except Exception:
+            pass
+
+
+def _icon_key(name: str, is_dir: bool) -> str:
+    if is_dir:
+        return "dir"
+    return os.path.splitext(name)[1].lower().lstrip(".") or "noext"
+
+
+def _icon_png_for_key(key: str) -> bytes:
+    """PNG bytes for an icon key, extracting + caching on first use."""
+    if sys.platform != "win32":
+        return b""
+    if key not in _ICON_PNG:
+        is_dir = key == "dir"
+        ext = "" if key in ("dir", "noext") else "." + key
+        try:
+            _ICON_PNG[key] = _extract_icon_png(
+                "folder" if is_dir else "file" + ext, is_dir)
+        except Exception:
+            _ICON_PNG[key] = b""
+    return _ICON_PNG[key]
+
+
+def icon_url(name: str, is_dir: bool) -> str:
+    """Same-origin URL for this item's type icon ('' if none/unsupported)."""
+    key = _icon_key(name, is_dir)
+    return f"/icon/{key}" if _icon_png_for_key(key) else ""
 
 
 @dataclass
@@ -715,6 +815,18 @@ def find_duplicates(item: Item, min_size: int = 1_048_576) -> list[list[Item]]:
 
 app = Dash(__name__, title="Disk Space Dashboard")
 
+
+@app.server.route("/icon/<key>")
+def _serve_icon(key):
+    """Serve a cached Windows type-icon PNG (used by the table's Name column)."""
+    from flask import Response
+    png = _icon_png_for_key(key)
+    if not png:
+        return Response(status=204)
+    return Response(png, mimetype="image/png",
+                    headers={"Cache-Control": "max-age=86400"})
+
+
 # Container chrome is themed with CSS variables so the light/dark toggle flips
 # instantly (clientside), no server round-trip. The two themes redefine these
 # vars; html.light is toggled by the theme button.
@@ -1008,7 +1120,8 @@ app.layout = html.Div(
                             children=dash_table.DataTable(
                                 id="table",
                                 columns=[
-                                    dict(name="Name", id="name"),
+                                    dict(name="Name", id="name",
+                                         presentation="markdown"),
                                     dict(name="Size", id="size"),
                                     dict(name="%", id="pct", type="numeric",
                                          format=Format(precision=1,
@@ -1016,6 +1129,7 @@ app.layout = html.Div(
                                     dict(name="Modified", id="modified"),
                                     dict(name="Type", id="type"),
                                 ],
+                                markdown_options={"html": False},
                                 data=[],
                                 page_size=200,
                                 row_selectable="multi",
@@ -1318,8 +1432,10 @@ def fill_table(cur_path, _refresh, search, minsize, kind, privacy):
             if parent and parent != node.path:
                 sub = os.path.relpath(parent, rel_from)
                 display = f"{display}   ·   {sub}"
+        url = icon_url(c.name, c.is_dir)
+        cell = f"![]({url}) {display}" if url else display
         rows.append(dict(
-            name=display,
+            name=cell,
             size=human_size(c.size),
             pct=c.size / total,                 # fraction -> percentage format
             modified=fmt_iso(c.mtime),          # ISO so the column sorts by date
@@ -1369,8 +1485,14 @@ def show_details(sel_rows, cur_path, privacy, view_data):
         (os.path.splitext(item.name)[1].lstrip(".").upper() or "File") + " file")
     disp_name = mask_name(item.name, item.is_dir, privacy)
     disp_path = "🔒  hidden" if privacy else item.path
+    url = icon_url(item.name, item.is_dir)
+    header = [html.Span(_trim(disp_name, 58))]
+    if url:
+        header.insert(0, html.Img(src=url, height="16",
+                                  style=dict(verticalAlign="-2px",
+                                             marginRight="6px")))
     return html.Div([
-        html.Div(_trim(disp_name, 60),
+        html.Div(header,
                  style=dict(fontWeight="700", fontSize="14px",
                             marginBottom="6px", wordBreak="break-all")),
         row("Size", human_size(item.size)),
