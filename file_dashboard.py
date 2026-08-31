@@ -30,8 +30,9 @@ import os
 import sys
 import math
 import heapq
+import datetime
+import threading
 import subprocess
-from collections import deque
 from dataclasses import dataclass, field
 
 # Folder-picker child process: handled before the (heavier) Dash imports so the
@@ -105,12 +106,23 @@ def _trim(s: str, n: int) -> str:
 
 @dataclass
 class Item:
-    """One file or folder plus its total size in bytes."""
+    """One file or folder plus its total size in bytes and modified time."""
     name: str
     path: str
     size: int
     is_dir: bool
     children: list = field(default_factory=list)
+    mtime: float = 0.0
+
+
+def fmt_date(ts: float) -> str:
+    """Epoch seconds -> '23 Aug 2026' (or '—' when unknown)."""
+    if not ts:
+        return "—"
+    try:
+        return datetime.datetime.fromtimestamp(ts).strftime("%d %b %Y")
+    except (OSError, OverflowError, ValueError):
+        return "—"
 
 
 # ----------------------------- scanner ------------------------------------- #
@@ -120,20 +132,33 @@ class Item:
 INDEX: dict[str, Item] = {}
 ROOT_PATH: str | None = None
 
+# Shared state for the background scan (progress polling + cancellation).
+SCAN = {
+    "running": False, "cancel": False, "done": False, "error": None,
+    "count": 0, "bytes": 0, "skipped": 0, "current": "", "root": None,
+}
 
-def scan_directory(root_path: str) -> Item:
+
+class _Cancelled(Exception):
+    """Raised inside the scan walk to abort a cancelled scan."""
+
+
+def scan_directory(root_path: str, state: dict | None = None) -> Item:
     """
-    Walk a directory tree, returning an Item tree with cumulative sizes,
-    and (re)build the global INDEX path -> Item.
+    Walk a directory tree, returning an Item tree with cumulative sizes and
+    modified times, and (re)build the global INDEX path -> Item.
 
-    Symlinks are skipped (avoids loops / double counting). Permission errors
-    and unreadable entries are skipped silently.
+    Symlinks are skipped (avoids loops / double counting). Permission errors and
+    unreadable entries are skipped, counted in state["skipped"]. If `state` is
+    given, progress counters are updated and state["cancel"] aborts the walk.
     """
     global INDEX, ROOT_PATH
     INDEX = {}
     ROOT_PATH = os.path.abspath(root_path)
 
     def walk(path: str, name: str) -> Item:
+        if state and state["cancel"]:
+            raise _Cancelled()
         total = 0
         children = []
         try:
@@ -147,19 +172,53 @@ def scan_directory(root_path: str) -> Item:
                             children.append(child)
                             total += child.size
                         elif entry.is_file(follow_symlinks=False):
-                            size = entry.stat(follow_symlinks=False).st_size
-                            children.append(Item(entry.name, entry.path, size, False))
-                            total += size
+                            st = entry.stat(follow_symlinks=False)
+                            children.append(Item(entry.name, entry.path,
+                                                 st.st_size, False,
+                                                 mtime=st.st_mtime))
+                            total += st.st_size
+                            if state is not None:
+                                state["count"] += 1
+                                state["bytes"] += st.st_size
+                                if state["count"] % 400 == 0:
+                                    state["current"] = path
                     except (PermissionError, OSError):
+                        if state is not None:
+                            state["skipped"] += 1
                         continue
         except (PermissionError, OSError):
-            pass
-        node = Item(name, path, total, True, children)
+            if state is not None:
+                state["skipped"] += 1
+        try:
+            dmt = os.stat(path).st_mtime
+        except OSError:
+            dmt = 0.0
+        node = Item(name, path, total, True, children, mtime=dmt)
         INDEX[os.path.abspath(path)] = node
         return node
 
     disp = os.path.basename(ROOT_PATH.rstrip("\\/")) or ROOT_PATH
     return walk(ROOT_PATH, disp)
+
+
+def start_scan(path: str) -> None:
+    """Kick off scan_directory in a daemon thread, updating SCAN as it goes."""
+    SCAN.update(running=True, cancel=False, done=False, error=None,
+                count=0, bytes=0, skipped=0, current=path, root=None)
+
+    def worker():
+        try:
+            tree = scan_directory(path, SCAN)
+            SCAN["root"] = tree
+            SCAN["done"] = True
+        except _Cancelled:
+            SCAN["error"] = "cancelled"
+        except Exception as e:               # noqa: BLE001 - surfaced in the UI
+            SCAN["error"] = str(e)
+        finally:
+            SCAN["running"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def pick_folder_dialog() -> str | None:
@@ -548,6 +607,15 @@ BTN_STYLE = dict(
     borderRadius="8px", padding="10px 16px", cursor="pointer",
     fontSize="14px", fontWeight="600",
 )
+# Cancel button visibility (toggled by the scan callbacks).
+CANCEL_SHOWN = {**BTN_STYLE, "backgroundColor": "#ED553B", "padding": "8px 14px",
+                "fontSize": "13px"}
+CANCEL_HIDDEN = {**CANCEL_SHOWN, "display": "none"}
+INPUT_STYLE = dict(
+    backgroundColor="var(--panel)", color="var(--fg)",
+    border="1px solid var(--line)", borderRadius="6px", padding="6px 10px",
+    fontSize="13px",
+)
 
 
 def card(card_id, title):
@@ -581,6 +649,7 @@ app.layout = html.Div(
         dcc.Store(id="pending-delete"),
         dcc.Store(id="theme", data="dark"),
         dcc.ConfirmDialog(id="confirm-del"),
+        dcc.Interval(id="scan-poll", interval=300, disabled=True),
         html.Div(
             style=dict(display="flex", alignItems="center", gap="10px",
                        marginBottom="12px"),
@@ -593,10 +662,14 @@ app.layout = html.Div(
                          style=dict(color="var(--muted)", marginLeft="6px",
                                     overflow="hidden", textOverflow="ellipsis",
                                     whiteSpace="nowrap", flex="1")),
+                html.Div(id="scan-status",
+                         style=dict(color="var(--muted)", fontSize="12px",
+                                    whiteSpace="nowrap", overflow="hidden",
+                                    textOverflow="ellipsis", maxWidth="420px")),
+                html.Button("✖  Cancel", id="cancel-btn", n_clicks=0,
+                            style=CANCEL_HIDDEN),
                 html.Button("◐  Light / Dark", id="theme-btn", n_clicks=0,
                             style={**BTN_STYLE, "backgroundColor": "#666"}),
-                dcc.Loading(html.Div(id="scan-status"),
-                            type="circle", color="#3a7ebf"),
             ],
         ),
         html.Div(
@@ -662,9 +735,42 @@ app.layout = html.Div(
                             "use the radio to pick a target for the buttons.",
                             style=dict(fontWeight="700", padding="6px 4px",
                                        fontSize="13px")),
+                        # search + filters
                         html.Div(
                             style=dict(display="flex", gap="8px",
-                                       margin="4px 4px 8px"),
+                                       margin="2px 4px 8px", alignItems="center"),
+                            children=[
+                                dcc.Input(id="search", type="text", debounce=True,
+                                          placeholder="🔍  Search name…",
+                                          style={**INPUT_STYLE, "flex": "1"}),
+                                dcc.Dropdown(
+                                    id="minsize", clearable=False, value=0,
+                                    options=[
+                                        {"label": "Any size", "value": 0},
+                                        {"label": "≥ 1 MB", "value": 1_048_576},
+                                        {"label": "≥ 10 MB", "value": 10_485_760},
+                                        {"label": "≥ 100 MB", "value": 104_857_600},
+                                        {"label": "≥ 1 GB", "value": 1_073_741_824},
+                                    ],
+                                    style=dict(width="130px", fontSize="13px"),
+                                ),
+                                dcc.RadioItems(
+                                    id="kind", value="all",
+                                    options=[{"label": " All", "value": "all"},
+                                             {"label": " Files", "value": "files"},
+                                             {"label": " Folders",
+                                              "value": "folders"}],
+                                    inline=True,
+                                    style=dict(fontSize="13px"),
+                                    inputStyle=dict(marginRight="3px",
+                                                    marginLeft="8px"),
+                                ),
+                            ],
+                        ),
+                        # actions
+                        html.Div(
+                            style=dict(display="flex", gap="8px",
+                                       margin="0 4px 8px"),
                             children=[
                                 html.Button("📂  Open in Explorer", id="open-btn",
                                             n_clicks=0,
@@ -678,40 +784,62 @@ app.layout = html.Div(
                                                    "backgroundColor": "#ED553B"}),
                             ],
                         ),
-                        dash_table.DataTable(
-                            id="table",
-                            columns=[
-                                dict(name="Name", id="name"),
-                                dict(name="Size", id="size"),
-                                dict(name="%", id="pct"),
-                                dict(name="Type", id="type"),
-                            ],
-                            data=[],
-                            page_size=100,
-                            row_selectable="single",
-                            selected_rows=[],
-                            style_table=dict(height=TABLE_H, overflowY="auto"),
-                            style_cell_conditional=[
-                                dict(if_=dict(column_id="name"), width="45%"),
-                                dict(if_=dict(column_id="size"), width="20%"),
-                                dict(if_=dict(column_id="pct"), width="15%"),
-                                dict(if_=dict(column_id="type"), width="20%"),
-                            ],
-                            style_header=dict(backgroundColor="var(--head)",
-                                              color="var(--fg)", fontWeight="700",
-                                              border="none", textAlign="center"),
-                            style_cell=dict(backgroundColor="var(--panel)",
-                                            color="var(--fg)",
-                                            border="none", padding="6px 10px",
-                                            fontSize="13px", textAlign="center",
-                                            maxWidth=0, overflow="hidden",
-                                            textOverflow="ellipsis"),
-                            style_data_conditional=[
-                                dict(if_=dict(filter_query='{type} = "Folder"',
-                                              column_id="name"),
-                                     color="#6cb6ff", cursor="pointer"),
-                            ],
-                            cell_selectable=True,
+                        # table (grows to fill; details panel sits below)
+                        html.Div(
+                            style=dict(flex="1", minHeight="0", overflow="hidden"),
+                            children=dash_table.DataTable(
+                                id="table",
+                                columns=[
+                                    dict(name="Name", id="name"),
+                                    dict(name="Size", id="size"),
+                                    dict(name="%", id="pct"),
+                                    dict(name="Modified", id="modified"),
+                                    dict(name="Type", id="type"),
+                                ],
+                                data=[],
+                                page_size=200,
+                                row_selectable="single",
+                                selected_rows=[],
+                                style_table=dict(height="100%", overflowY="auto"),
+                                style_cell_conditional=[
+                                    dict(if_=dict(column_id="name"), width="34%"),
+                                    dict(if_=dict(column_id="size"), width="15%"),
+                                    dict(if_=dict(column_id="pct"), width="11%"),
+                                    dict(if_=dict(column_id="modified"),
+                                         width="22%"),
+                                    dict(if_=dict(column_id="type"), width="18%"),
+                                ],
+                                style_header=dict(backgroundColor="var(--head)",
+                                                  color="var(--fg)",
+                                                  fontWeight="700",
+                                                  border="none",
+                                                  textAlign="center"),
+                                style_cell=dict(backgroundColor="var(--panel)",
+                                                color="var(--fg)",
+                                                border="none", padding="6px 10px",
+                                                fontSize="13px",
+                                                textAlign="center",
+                                                maxWidth=0, overflow="hidden",
+                                                textOverflow="ellipsis"),
+                                style_data_conditional=[
+                                    dict(if_=dict(
+                                        filter_query='{type} = "Folder"',
+                                        column_id="name"),
+                                        color="#6cb6ff", cursor="pointer"),
+                                ],
+                                cell_selectable=True,
+                            ),
+                        ),
+                        # selected-item details
+                        html.Div(
+                            id="details",
+                            style=dict(borderTop="1px solid var(--line)",
+                                       marginTop="6px", paddingTop="8px",
+                                       minHeight="118px"),
+                            children=html.Div(
+                                "Select a row to see details.",
+                                style=dict(color="var(--muted)",
+                                           fontSize="13px", padding="10px 4px")),
                         ),
                     ],
                 ),
@@ -742,55 +870,97 @@ app.clientside_callback(
 
 # ----------------------------- callbacks ----------------------------------- #
 
+# ---- Start a scan (native folder picker -> background thread + polling) ---- #
 @app.callback(
-    Output("current-path", "data"),
+    Output("scan-poll", "disabled"),
+    Output("cancel-btn", "style"),
     Output("scan-status", "children"),
     Input("browse", "n_clicks"),
+    prevent_initial_call=True,
+)
+def start_scan_cb(_n):
+    chosen = pick_folder_dialog()
+    if not chosen:
+        return True, CANCEL_HIDDEN, ""
+    start_scan(chosen)
+    return False, CANCEL_SHOWN, "Starting scan…"
+
+
+# ---- Poll scan progress; commit result when finished ---- #
+@app.callback(
+    Output("current-path", "data", allow_duplicate=True),
+    Output("scan-poll", "disabled", allow_duplicate=True),
+    Output("cancel-btn", "style", allow_duplicate=True),
+    Output("scan-status", "children", allow_duplicate=True),
+    Input("scan-poll", "n_intervals"),
+    prevent_initial_call=True,
+)
+def poll_scan(_n):
+    if SCAN["running"]:
+        cur = SCAN["current"]
+        short = cur if len(cur) < 60 else "…" + cur[-57:]
+        txt = (f"Scanning… {SCAN['count']:,} files · "
+               f"{human_size(SCAN['bytes'])} · {short}")
+        return no_update, False, CANCEL_SHOWN, txt
+    if SCAN["done"]:
+        skipped = SCAN["skipped"]
+        note = (f"  ⚠ {skipped:,} items skipped (permissions)"
+                if skipped else "")
+        return ROOT_PATH, True, CANCEL_HIDDEN, note or ""
+    if SCAN["error"] == "cancelled":
+        return no_update, True, CANCEL_HIDDEN, "Scan cancelled."
+    if SCAN["error"]:
+        return no_update, True, CANCEL_HIDDEN, f"Error: {SCAN['error']}"
+    return no_update, True, CANCEL_HIDDEN, no_update
+
+
+# ---- Cancel a running scan ---- #
+@app.callback(
+    Output("scan-status", "children", allow_duplicate=True),
+    Input("cancel-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def cancel_scan_cb(_n):
+    SCAN["cancel"] = True
+    return "Cancelling…"
+
+
+# ---- Navigate: Up, and drill-in by clicking a folder name ---- #
+@app.callback(
+    Output("current-path", "data"),
     Input("up", "n_clicks"),
     Input("table", "active_cell"),
     State("current-path", "data"),
     State("table", "data"),
     prevent_initial_call=True,
 )
-def navigate(_b, _u, active_cell, cur_path, table_data):
+def navigate(_u, active_cell, cur_path, table_data):
     trigger = ctx.triggered_id
-
-    if trigger == "browse":
-        chosen = pick_folder_dialog()
-        if not chosen:
-            return no_update, ""
-        scan_directory(chosen)          # rebuilds INDEX, sets ROOT_PATH
-        return ROOT_PATH, ""
 
     if trigger == "up":
         if not cur_path or cur_path == ROOT_PATH:
-            return no_update, no_update
+            return no_update
         parent = os.path.dirname(cur_path)
-        if parent in INDEX:
-            return parent, no_update
-        return no_update, no_update
+        return parent if parent in INDEX else no_update
 
     if trigger == "table" and active_cell and table_data:
         # only a click on the Name column drills in (radio handles selection)
         if active_cell.get("column_id") != "name":
-            return no_update, no_update
+            return no_update
         row = active_cell.get("row")
         if row is None or row >= len(table_data):
-            return no_update, no_update
-        node = INDEX.get(cur_path)
-        if not node:
-            return no_update, no_update
-        name = table_data[row]["name"]
-        for c in node.children:
-            if c.name == name and c.is_dir and c.children:
-                return c.path, no_update
-        return no_update, no_update
+            return no_update
+        path = table_data[row].get("path")
+        node = INDEX.get(path)
+        if node and node.is_dir and node.children:
+            return path
+        return no_update
 
-    return no_update, no_update
+    return no_update
 
 
 def selected_item(cur_path, selected_rows, table_data) -> Item | None:
-    """Resolve the table's selected radio row to its Item under the current node."""
+    """Resolve the table's selected radio row to its Item (matched by path)."""
     if not selected_rows or not table_data:
         return None
     i = selected_rows[0]
@@ -799,9 +969,9 @@ def selected_item(cur_path, selected_rows, table_data) -> Item | None:
     node = INDEX.get(cur_path)
     if not node:
         return None
-    name = table_data[i]["name"]
+    path = table_data[i].get("path")
     for c in node.children:
-        if c.name == name:
+        if c.path == path:
             return c
     return None
 
@@ -816,7 +986,6 @@ def selected_item(cur_path, selected_rows, table_data) -> Item | None:
     Output("sunburst", "figure"),
     Output("bar", "figure"),
     Output("filetype", "figure"),
-    Output("table", "data"),
     Output("footer", "children"),
     Input("current-path", "data"),
     Input("refresh", "data"),
@@ -829,7 +998,7 @@ def render(cur_path, _refresh, theme_name):
     if not node:
         return ("—", "—", "—", "—", "No folder selected",
                 empty_fig(th=th), empty_fig(th=th), empty_fig(th=th),
-                empty_fig(th=th), [], "Ready.")
+                empty_fig(th=th), "Ready.")
 
     # counts across subtree
     files = dirs = 0
@@ -848,21 +1017,90 @@ def render(cur_path, _refresh, theme_name):
         b = max(node.children, key=lambda c: c.size)
         biggest_txt = f"{_trim(b.name, 20)}\n{human_size(b.size)}"
 
-    total = node.size or 1
-    rows = sorted(node.children, key=lambda c: c.size, reverse=True)
-    data = [
-        dict(name=c.name, size=human_size(c.size),
-             pct=f"{100.0 * c.size / total:.1f}%",
-             type="Folder" if c.is_dir else "File")
-        for c in rows
-    ]
-
     footer = (f"{cur_path}  —  {len(node.children)} items, "
               f"{human_size(node.size)} total")
 
     return (human_size(node.size), f"{files:,}", f"{dirs:,}", biggest_txt,
             cur_path, treemap_fig(node, th), sunburst_fig(node, th),
-            bar_fig(node, th), filetype_fig(node, th=th), data, footer)
+            bar_fig(node, th), filetype_fig(node, th=th), footer)
+
+
+# ---- Table: filtered/searched list of the current folder's children ---- #
+@app.callback(
+    Output("table", "data"),
+    Input("current-path", "data"),
+    Input("refresh", "data"),
+    Input("search", "value"),
+    Input("minsize", "value"),
+    Input("kind", "value"),
+    prevent_initial_call=True,
+)
+def fill_table(cur_path, _refresh, search, minsize, kind):
+    node = INDEX.get(cur_path) if cur_path else None
+    if not node:
+        return []
+    total = node.size or 1
+    q = (search or "").lower().strip()
+    try:
+        mn = int(minsize or 0)
+    except (TypeError, ValueError):
+        mn = 0
+    rows = []
+    for c in sorted(node.children, key=lambda c: c.size, reverse=True):
+        if q and q not in c.name.lower():
+            continue
+        if c.size < mn:
+            continue
+        if kind == "files" and c.is_dir:
+            continue
+        if kind == "folders" and not c.is_dir:
+            continue
+        rows.append(dict(
+            name=c.name, size=human_size(c.size),
+            pct=f"{100.0 * c.size / total:.1f}%",
+            modified=fmt_date(c.mtime),
+            type="Folder" if c.is_dir else "File",
+            path=c.path,          # hidden: used for selection + drill-in
+        ))
+    return rows
+
+
+# ---- Selected-item details panel ---- #
+@app.callback(
+    Output("details", "children"),
+    Input("table", "selected_rows"),
+    Input("current-path", "data"),
+    State("table", "data"),
+    State("theme", "data"),
+    prevent_initial_call=True,
+)
+def show_details(selected_rows, cur_path, table_data, theme_name):
+    item = selected_item(cur_path, selected_rows, table_data)
+    if not item:
+        return html.Div("Select a row to see details.",
+                        style=dict(color="var(--muted)", fontSize="13px",
+                                   padding="10px 4px"))
+
+    def row(label, value):
+        return html.Div(
+            [html.Span(label, style=dict(color="var(--muted)", width="76px",
+                                         display="inline-block",
+                                         fontSize="12px")),
+             html.Span(value, style=dict(fontSize="13px"))],
+            style=dict(marginBottom="3px"),
+        )
+
+    kind = "Folder" if item.is_dir else (
+        (os.path.splitext(item.name)[1].lstrip(".").upper() or "File") + " file")
+    return html.Div([
+        html.Div(_trim(item.name, 60),
+                 style=dict(fontWeight="700", fontSize="14px",
+                            marginBottom="6px", wordBreak="break-all")),
+        row("Size", human_size(item.size)),
+        row("Modified", fmt_date(item.mtime)),
+        row("Type", kind),
+        row("Path", item.path),
+    ])
 
 
 # ---- Open in Explorer ---- #
