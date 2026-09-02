@@ -1,12 +1,27 @@
 # Disk Space Dashboard
 
-Desktop app to see which folders and files eat your disk space. Interactive
-Plotly treemap / sunburst / bar / file-type charts, plus a table with
-open-in-Explorer and delete-to-Recycle-Bin.
+Desktop app to see which folders and files eat your disk space.
+
+- **Drives overview** — free-space gauge per drive; click one to scan it.
+- **Charts** — interactive treemap, sunburst, bar, file-types, and file-age,
+  with a selectable colour palette and light/dark themes.
+- **Table** — recursive search, size/type filters, sortable columns, real
+  Windows file icons, and a details panel.
+- **Actions** — open in Explorer, multi-select delete to the Recycle Bin.
+- **Duplicate finder** — staged size → quick-hash → full-hash, with a
+  potential-savings summary.
+- **Privacy mode** — hide file/folder names for screenshots.
 
 Built with **Python + Dash + Plotly**, shown in a native window via
 **pywebview** — which uses the OS's built-in web engine (Edge WebView2 on
 Windows), so there's no Electron and no bundled Chromium.
+
+## Tests
+
+```bash
+pip install pytest
+python -m pytest -q
+```
 
 ## Run
 

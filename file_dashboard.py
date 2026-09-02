@@ -55,9 +55,13 @@ if "--pick-folder" in sys.argv:
     print(_p or "")
     sys.exit(0)
 
+import shutil
+import string
+
 import plotly.graph_objects as go
 from send2trash import send2trash
-from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx, no_update
+from dash import (Dash, dcc, html, dash_table, Input, Output, State, ctx,
+                  no_update, ALL)
 from dash.dash_table.Format import Format, Scheme
 
 
@@ -72,6 +76,27 @@ COLOR_SCALE = [
     [0.75, "#F6D55C"],
     [1.00, "#ED553B"],
 ]
+
+# Selectable size colour-scales. Values are anything Plotly accepts for
+# marker.colorscale (a list of stops, or a built-in name). Small -> big.
+PALETTES = {
+    "Sunset (default)": COLOR_SCALE,
+    "Ocean": [[0.0, "#0b2545"], [0.5, "#3a7ebf"], [1.0, "#8ecae6"]],
+    "Viridis": "Viridis",
+    "Plasma": "Plasma",
+    "Turbo": "Turbo",
+    "Cividis": "Cividis",
+    "Blues": "Blues",
+    "Greens": "Greens",
+    "Hot": "Hot",
+}
+DEFAULT_PALETTE = "Sunset (default)"
+
+
+def palette_scale(name):
+    return PALETTES.get(name, COLOR_SCALE)
+
+
 BG = "#1e1e1e"
 PANEL = "#242424"
 FG = "#e6e6e6"
@@ -343,6 +368,82 @@ def start_scan(path: str) -> None:
     threading.Thread(target=worker, daemon=True).start()
 
 
+# ----------------------------- drives -------------------------------------- #
+
+def list_drives() -> list[tuple[str, int, int, int]]:
+    """Return [(mount, total, used, free)] for every ready drive."""
+    out = []
+    if sys.platform == "win32":
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i, letter in enumerate(string.ascii_uppercase):
+            if not (bitmask & (1 << i)):
+                continue
+            root = f"{letter}:\\"
+            try:
+                u = shutil.disk_usage(root)
+                out.append((root, u.total, u.used, u.free))
+            except OSError:
+                continue
+    else:
+        for root in ("/",):
+            try:
+                u = shutil.disk_usage(root)
+                out.append((root, u.total, u.used, u.free))
+            except OSError:
+                continue
+    return out
+
+
+def _usage_color(frac: float) -> str:
+    """Green under 75% used, amber under 90%, red beyond — cleanup pressure."""
+    if frac >= 0.90:
+        return "#ED553B"
+    if frac >= 0.75:
+        return "#F6D55C"
+    return "#3CAEA3"
+
+
+def drives_cards(th):
+    """Clickable free-space cards, one per drive (click a card to scan it)."""
+    cards = []
+    for root, total, used, free in list_drives():
+        frac = used / total if total else 0
+        col = _usage_color(frac)
+        cards.append(html.Div(
+            id={"type": "drive-card", "path": root},
+            n_clicks=0,
+            style=dict(backgroundColor=th["panel"], borderRadius="12px",
+                       padding="18px 20px", width="260px", cursor="pointer",
+                       border=f"1px solid {th['grid']}"),
+            children=[
+                html.Div([
+                    html.Span("🖴  ", style=dict(fontSize="20px")),
+                    html.Span(root, style=dict(fontSize="20px",
+                                               fontWeight="700")),
+                ]),
+                html.Div(f"{human_size(free)} free",
+                         style=dict(fontSize="15px", fontWeight="700",
+                                    marginTop="8px", color=col)),
+                html.Div(f"of {human_size(total)}",
+                         style=dict(fontSize="12px", color=th["muted"])),
+                # usage bar
+                html.Div(
+                    style=dict(height="10px", borderRadius="5px",
+                               backgroundColor=th["grid"], marginTop="12px",
+                               overflow="hidden"),
+                    children=html.Div(style=dict(
+                        width=f"{frac * 100:.1f}%", height="100%",
+                        backgroundColor=col)),
+                ),
+                html.Div(f"{frac * 100:.0f}% used  ·  "
+                         f"{human_size(used)} used",
+                         style=dict(fontSize="12px", color=th["muted"],
+                                    marginTop="6px")),
+            ],
+        ))
+    return cards
+
+
 def pick_folder_dialog() -> str | None:
     """
     Open the native folder-picker by re-invoking this program with --pick-folder
@@ -375,9 +476,11 @@ def empty_fig(msg="Select a folder to begin", th=THEMES["dark"]):
     fig = go.Figure()
     fig.update_layout(**base_layout(th))
     fig.add_annotation(text=msg, showarrow=False,
-                       font=dict(color=th["muted"], size=16), x=0.5, y=0.5)
-    fig.update_xaxes(visible=False)
-    fig.update_yaxes(visible=False)
+                       font=dict(color=th["muted"], size=16),
+                       xref="paper", yref="paper", x=0.5, y=0.5,
+                       xanchor="center", yanchor="middle")
+    fig.update_xaxes(visible=False, range=[0, 1])
+    fig.update_yaxes(visible=False, range=[0, 1])
     return fig
 
 
@@ -458,7 +561,8 @@ def build_hierarchy(item: Item, max_nodes: int = 700, max_depth: int = 6,
     return ids, labels, parents, values, custom, node_colors
 
 
-def treemap_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
+def treemap_fig(item: Item, th=THEMES["dark"], privacy=False,
+                scale=COLOR_SCALE) -> go.Figure:
     """
     Hierarchical treemap of the current folder's subtree. Click a tile to zoom
     in, click the header (pathbar) to zoom back out. Colour = size vs. siblings
@@ -479,7 +583,7 @@ def treemap_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
         customdata=custom,
         marker=dict(
             colors=node_colors,
-            colorscale=COLOR_SCALE,
+            colorscale=scale,
             cmin=0.0, cmax=1.0,
             cornerradius=6,                     # modern rounded tiles
             pad=dict(t=28, l=4, r=4, b=4),
@@ -516,7 +620,8 @@ def treemap_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
     return fig
 
 
-def sunburst_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
+def sunburst_fig(item: Item, th=THEMES["dark"], privacy=False,
+                 scale=COLOR_SCALE) -> go.Figure:
     """
     Radial hierarchy of the current folder's subtree. Rings = depth, angle =
     size; click a wedge to zoom in, click the centre to zoom out. Same data and
@@ -538,7 +643,7 @@ def sunburst_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
         insidetextorientation="radial",
         marker=dict(
             colors=node_colors,
-            colorscale=COLOR_SCALE,
+            colorscale=scale,
             cmin=0.0, cmax=1.0,
             colorbar=dict(
                 title=dict(text="Size vs.<br>siblings", side="right",
@@ -569,7 +674,8 @@ def sunburst_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
     return fig
 
 
-def filetype_fig(item: Item, top: int = 15, th=THEMES["dark"]) -> go.Figure:
+def filetype_fig(item: Item, top: int = 15, th=THEMES["dark"],
+                 scale=COLOR_SCALE) -> go.Figure:
     """Aggregate the whole subtree by file extension; bar of the space hogs."""
     agg: dict[str, int] = {}
     cnt: dict[str, int] = {}
@@ -594,7 +700,7 @@ def filetype_fig(item: Item, top: int = 15, th=THEMES["dark"]) -> go.Figure:
 
     fig = go.Figure(go.Bar(
         x=values, y=exts, orientation="h",
-        marker=dict(color=values, colorscale=COLOR_SCALE,
+        marker=dict(color=values, colorscale=scale,
                     cmin=min(values), cmax=max(values), line=dict(width=0)),
         text=labels, textposition="outside",
         hovertemplate="<b>%{y}</b><br>%{text}<extra></extra>",
@@ -666,7 +772,8 @@ def open_in_explorer(path: str) -> bool:
         return False
 
 
-def bar_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
+def bar_fig(item: Item, th=THEMES["dark"], privacy=False,
+            scale=COLOR_SCALE) -> go.Figure:
     """Horizontal bar of the biggest items, same size colour scale."""
     kids = sorted(item.children, key=lambda c: c.size, reverse=True)[:15]
     if not kids:
@@ -679,7 +786,7 @@ def bar_fig(item: Item, th=THEMES["dark"], privacy=False) -> go.Figure:
     fig = go.Figure(go.Bar(
         x=values, y=names, orientation="h",
         marker=dict(
-            color=values, colorscale=COLOR_SCALE,
+            color=values, colorscale=scale,
             cmin=min(values), cmax=max(values),
             line=dict(width=0),
         ),
@@ -706,7 +813,7 @@ AGE_BUCKETS = [
 ]
 
 
-def age_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
+def age_fig(item: Item, th=THEMES["dark"], scale=COLOR_SCALE) -> go.Figure:
     """Bar of total file size by modified-age bucket (older = warmer colour)."""
     now = time.time()
     sizes = [0] * len(AGE_BUCKETS)
@@ -732,7 +839,7 @@ def age_fig(item: Item, th=THEMES["dark"]) -> go.Figure:
     text = [human_size(s) if s else "" for s in sizes]
     fig = go.Figure(go.Bar(
         x=labels, y=sizes,
-        marker=dict(color=colours, colorscale=COLOR_SCALE, cmin=0, cmax=1,
+        marker=dict(color=colours, colorscale=scale, cmin=0, cmax=1,
                     line=dict(width=0)),
         text=text, textposition="outside",
         customdata=[[human_size(s), n] for s, n in zip(sizes, counts)],
@@ -973,6 +1080,8 @@ app.layout = html.Div(
             children=[
                 html.Button("📁  Select Folder", id="browse", n_clicks=0,
                             style=BTN_STYLE),
+                html.Button("🖴  Drives", id="drives-btn", n_clicks=0,
+                            style={**BTN_STYLE, "backgroundColor": "#666"}),
                 html.Button("⬆  Up", id="up", n_clicks=0,
                             style={**BTN_STYLE, "backgroundColor": "#666"}),
                 html.Div("No folder selected", id="path-label",
@@ -985,6 +1094,11 @@ app.layout = html.Div(
                                     textOverflow="ellipsis", maxWidth="420px")),
                 html.Button("✖  Cancel", id="cancel-btn", n_clicks=0,
                             style=CANCEL_HIDDEN),
+                dcc.Dropdown(
+                    id="palette", clearable=False, value=DEFAULT_PALETTE,
+                    options=[{"label": f"🎨 {k}", "value": k} for k in PALETTES],
+                    style=dict(width="170px", fontSize="13px"),
+                ),
                 html.Button("🕶  Hide names", id="privacy-btn", n_clicks=0,
                             style={**BTN_STYLE, "backgroundColor": "#666"}),
                 html.Button("◐  Light / Dark", id="theme-btn", n_clicks=0,
@@ -1021,31 +1135,31 @@ app.layout = html.Div(
                                     children=dcc.Graph(
                                         id="treemap", figure=empty_fig(),
                                         responsive=True,
-                                        style=dict(height=CHART_H))),
+                                        style=dict(height="100%"))),
                             dcc.Tab(label="Sunburst", value="sun",
                                     style=_tab(), selected_style=_tab(True),
                                     children=dcc.Graph(
                                         id="sunburst", figure=empty_fig(),
                                         responsive=True,
-                                        style=dict(height=CHART_H))),
+                                        style=dict(height="100%"))),
                             dcc.Tab(label="Bar Chart", value="bar",
                                     style=_tab(), selected_style=_tab(True),
                                     children=dcc.Graph(
                                         id="bar", figure=empty_fig(),
                                         responsive=True,
-                                        style=dict(height=CHART_H))),
+                                        style=dict(height="100%"))),
                             dcc.Tab(label="File Types", value="ftype",
                                     style=_tab(), selected_style=_tab(True),
                                     children=dcc.Graph(
                                         id="filetype", figure=empty_fig(),
                                         responsive=True,
-                                        style=dict(height=CHART_H))),
+                                        style=dict(height="100%"))),
                             dcc.Tab(label="File Age", value="age",
                                     style=_tab(), selected_style=_tab(True),
                                     children=dcc.Graph(
                                         id="agechart", figure=empty_fig(),
                                         responsive=True,
-                                        style=dict(height=CHART_H))),
+                                        style=dict(height="100%"))),
                             dcc.Tab(label="Duplicates", value="dupes",
                                     style=_tab(), selected_style=_tab(True),
                                     children=dupes_tab()),
@@ -1183,6 +1297,32 @@ app.layout = html.Div(
         html.Div("Ready.", id="footer",
                  style=dict(color="var(--muted)", marginTop="10px",
                             fontSize="12px")),
+        # Drives overview overlay (shown at start / via the Drives button)
+        html.Div(
+            id="drives-view",
+            style=dict(position="fixed", top="72px", left="0", right="0",
+                       bottom="0", backgroundColor="var(--bg)", zIndex="40",
+                       padding="24px 40px", overflowY="auto", display="flex",
+                       flexDirection="column", gap="14px"),
+            children=[
+                html.Div([
+                    html.Span("Drives", style=dict(fontSize="20px",
+                                                   fontWeight="700")),
+                    html.Span("  — click a drive to scan it, or use "
+                              "“Select Folder” for a specific folder.",
+                              style=dict(color="var(--muted)",
+                                         fontSize="14px")),
+                    html.Button("✕  Close", id="drives-close", n_clicks=0,
+                                style={**BTN_STYLE, "backgroundColor": "#666",
+                                       "padding": "6px 12px", "fontSize": "13px",
+                                       "float": "right"}),
+                ]),
+                html.Div(id="drives-cards",
+                         style=dict(display="flex", flexWrap="wrap",
+                                    gap="14px", marginTop="8px"),
+                         children=drives_cards(THEMES["dark"])),
+            ],
+        ),
     ],
 )
 
@@ -1217,20 +1357,68 @@ def toggle_privacy(n):
 
 # ----------------------------- callbacks ----------------------------------- #
 
+# ---- Drives overview overlay (open / close / recolour on theme) ---- #
+@app.callback(
+    Output("drives-cards", "children"),
+    Output("drives-view", "style"),
+    Input("drives-btn", "n_clicks"),
+    Input("drives-close", "n_clicks"),
+    Input("theme", "data"),
+    State("drives-view", "style"),
+    prevent_initial_call=True,
+)
+def drives_overlay(_open, _close, theme_name, style):
+    th = theme(theme_name)
+    style = dict(style or {})
+    trig = ctx.triggered_id
+    if trig == "drives-btn":
+        style["display"] = "flex"
+    elif trig == "drives-close":
+        style["display"] = "none"
+    return drives_cards(th), style
+
+
+# ---- Click a drive card -> scan that drive ---- #
+@app.callback(
+    Output("scan-poll", "disabled", allow_duplicate=True),
+    Output("cancel-btn", "style", allow_duplicate=True),
+    Output("scan-status", "children", allow_duplicate=True),
+    Output("drives-view", "style", allow_duplicate=True),
+    Input({"type": "drive-card", "path": ALL}, "n_clicks"),
+    State("drives-view", "style"),
+    prevent_initial_call=True,
+)
+def pick_drive(clicks, style):
+    if not clicks or not any(clicks):
+        return no_update, no_update, no_update, no_update
+    tid = ctx.triggered_id
+    path = tid["path"] if isinstance(tid, dict) else None
+    if not path:
+        return no_update, no_update, no_update, no_update
+    start_scan(path)
+    style = dict(style or {})
+    style["display"] = "none"
+    return False, CANCEL_SHOWN, "Starting scan…", style
+
+
 # ---- Start a scan (native folder picker -> background thread + polling) ---- #
 @app.callback(
     Output("scan-poll", "disabled"),
     Output("cancel-btn", "style"),
     Output("scan-status", "children"),
+    Output("drives-view", "style", allow_duplicate=True),
     Input("browse", "n_clicks"),
+    State("drives-view", "style"),
     prevent_initial_call=True,
 )
-def start_scan_cb(_n):
+def start_scan_cb(_n, style):
     chosen = pick_folder_dialog()
     if not chosen:
-        return True, CANCEL_HIDDEN, ""
+        return True, CANCEL_HIDDEN, "", no_update
     start_scan(chosen)
-    return False, CANCEL_SHOWN, "Starting scan…"
+    style = dict(style or {})
+    style["display"] = "none"
+    return False, CANCEL_SHOWN, "Starting scan…", style
 
 
 # ---- Poll scan progress; commit result when finished ---- #
@@ -1330,10 +1518,12 @@ def selected_items(cur_path, sel_rows, view_data) -> list[Item]:
     Input("refresh", "data"),
     Input("theme", "data"),
     Input("privacy", "data"),
+    Input("palette", "value"),
     prevent_initial_call=True,
 )
-def render(cur_path, _refresh, theme_name, privacy):
+def render(cur_path, _refresh, theme_name, privacy, palette):
     th = theme(theme_name)
+    sc = palette_scale(palette)
     node = INDEX.get(cur_path) if cur_path else None
     if not node:
         return ("—", "—", "—", "—", "No folder selected",
@@ -1363,9 +1553,9 @@ def render(cur_path, _refresh, theme_name, privacy):
               f"{human_size(node.size)} total")
 
     return (human_size(node.size), f"{files:,}", f"{dirs:,}", biggest_txt,
-            shown_path, treemap_fig(node, th, privacy),
-            sunburst_fig(node, th, privacy), bar_fig(node, th, privacy),
-            filetype_fig(node, th=th), age_fig(node, th), footer)
+            shown_path, treemap_fig(node, th, privacy, sc),
+            sunburst_fig(node, th, privacy, sc), bar_fig(node, th, privacy, sc),
+            filetype_fig(node, th=th, scale=sc), age_fig(node, th, sc), footer)
 
 
 # ---- Table: filtered/searched list of the current folder's children ---- #
