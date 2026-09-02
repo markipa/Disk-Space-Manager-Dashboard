@@ -68,6 +68,7 @@ from dsd.figures import (                                          # noqa: F401
     base_layout, empty_fig, build_hierarchy, treemap_fig, sunburst_fig,
     bar_fig, filetype_fig, age_fig, AGE_BUCKETS)
 from dsd.analysis import find_duplicates, _file_hash              # noqa: F401
+from dsd import mft
 
 # Back-compat alias (tests / older references used the leading-underscore name).
 _usage_color = usage_color
@@ -102,18 +103,57 @@ class _Cancelled(Exception):
     """Raised inside the scan walk to abort a cancelled scan."""
 
 
+def _is_drive_root(path: str) -> bool:
+    """True for 'C:\\' style drive roots (where the MFT fast path applies)."""
+    return (sys.platform == "win32" and len(path) == 3
+            and path[1] == ":" and path[2] in "\\/")
+
+
+def _item_factory(name, path, size, is_dir, mtime, children):
+    return Item(name, path, size, is_dir, children, mtime)
+
+
+def _iter_all_files(node):
+    """Yield every file (non-dir) under node — cheap in-memory walk."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        for c in n.children:
+            if c.is_dir:
+                stack.append(c)
+            else:
+                yield c
+
+
 def scan_directory(root_path: str, state: dict | None = None) -> Item:
     """
-    Walk a directory tree, returning an Item tree with cumulative sizes and
-    modified times, and (re)build the global INDEX path -> Item.
+    Build an Item tree with cumulative sizes and modified times, and (re)build
+    the global INDEX path -> Item.
 
-    Symlinks are skipped (avoids loops / double counting). Permission errors and
-    unreadable entries are skipped, counted in state["skipped"]. If `state` is
-    given, progress counters are updated and state["cancel"] aborts the walk.
+    Fast path: for a whole-drive scan on Windows *as Administrator*, read the
+    NTFS $MFT directly (dsd.mft) — ~100x faster than walking. Any failure falls
+    back to the os.scandir walk below. Symlinks are skipped; permission errors
+    are counted in state["skipped"]; state["cancel"] aborts the walk.
     """
     global INDEX, ROOT_PATH
+    abspath = os.path.abspath(root_path)
+
+    if _is_drive_root(abspath) and mft.is_admin():
+        try:
+            INDEX = {}
+            ROOT_PATH = abspath
+            if state is not None:
+                state["current"] = "Reading MFT (fast scan)…"
+            root = mft.build_tree(abspath[0], _item_factory, INDEX)
+            if state is not None:
+                state["count"] = sum(1 for _ in _iter_all_files(root))
+                state["bytes"] = root.size
+            return root
+        except Exception:
+            INDEX = {}          # discard any partial index, fall back below
+
     INDEX = {}
-    ROOT_PATH = os.path.abspath(root_path)
+    ROOT_PATH = abspath
 
     def walk(path: str, name: str) -> Item:
         if state and state["cancel"]:
@@ -725,6 +765,14 @@ app.layout = html.Div(
                          style=dict(display="flex", flexWrap="wrap",
                                     gap="14px", marginTop="8px"),
                          children=drives_cards(THEMES["dark"])),
+                html.Div(
+                    ("⚡ Running as Administrator — whole-drive scans use the "
+                     "NTFS MFT (near-instant)." if mft.is_admin() else
+                     "💡 Tip: run this app as Administrator for near-instant "
+                     "whole-drive scans (reads the NTFS MFT directly). Without "
+                     "admin it falls back to a normal folder walk."),
+                    style=dict(color="var(--muted)", fontSize="13px",
+                               marginTop="14px")),
             ],
         ),
     ],

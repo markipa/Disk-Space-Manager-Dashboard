@@ -16,6 +16,15 @@ Built with **Python + Dash + Plotly**, shown in a native window via
 **pywebview** — which uses the OS's built-in web engine (Edge WebView2 on
 Windows), so there's no Electron and no bundled Chromium.
 
+## Fast whole-drive scanning (NTFS MFT)
+
+Run the app **as Administrator** and scan a whole drive (e.g. `C:\`) — it reads
+the NTFS Master File Table directly (`dsd/mft.py`), which is ~100x faster than
+walking the tree, so a full drive scans in seconds. Without admin (or on
+non-NTFS / a specific sub-folder) it falls back to a normal `os.scandir` walk
+automatically. The MFT fast path is best-effort: any problem silently reverts to
+the walk.
+
 ## Tests
 
 ```bash

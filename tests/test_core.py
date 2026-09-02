@@ -112,3 +112,31 @@ def test_list_drives_nonempty():
     assert len(drives) >= 1
     root, total, used, free = drives[0]
     assert total > 0 and used + free <= total + total * 0.01
+
+
+# ----------------------------- MFT helpers --------------------------------- #
+
+from dsd import mft   # noqa: E402
+
+
+def test_is_drive_root():
+    assert fd._is_drive_root("C:\\") is True
+    assert fd._is_drive_root("C:\\Users") is False
+    assert fd._is_drive_root("C:") is False
+
+
+def test_filetime_conversion():
+    # FILETIME epoch base (1601->1970 offset) maps to Unix 0
+    assert mft._epoch_from_filetime(116444736000000000) == 0.0
+    assert mft._epoch_from_filetime(0) == 0.0
+    # one second later
+    assert abs(mft._epoch_from_filetime(116444736000000000 + 10_000_000)
+               - 1.0) < 1e-6
+
+
+def test_decode_runs():
+    # header 0x21: 1 length byte (0x18=24), 2 offset bytes (0x3456 LE) then end
+    runs = mft._decode_runs(b"\x21\x18\x56\x34\x00")
+    assert runs == [(0x3456, 24)]
+    # empty / terminator only
+    assert mft._decode_runs(b"\x00") == []

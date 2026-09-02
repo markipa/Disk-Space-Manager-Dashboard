@@ -38,7 +38,7 @@ hiddenimports += [
     "win32gui", "win32ui", "win32con", "pywintypes",
     "PIL.Image",
     # local package split out of file_dashboard.py
-    "dsd", "dsd.utils", "dsd.icons", "dsd.figures", "dsd.analysis",
+    "dsd", "dsd.utils", "dsd.icons", "dsd.figures", "dsd.analysis", "dsd.mft",
 ]
 
 a = Analysis(
