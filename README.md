@@ -63,7 +63,12 @@ folder). Zip that folder to distribute; the recipient unzips and runs the exe.
 ## Files
 | File | Purpose |
 |------|---------|
-| `file_dashboard.py` | The Dash app: scanner, figures, callbacks. |
+| `file_dashboard.py` | The Dash app: scanner state, drives, layout, callbacks. |
+| `dsd/` | Pure logic: `utils`, `icons`, `figures`, `analysis`. |
 | `desktop.py` | pywebview launcher (runs Dash in a thread, opens the window). |
 | `disk_dashboard.spec` | PyInstaller build config. |
 | `build/icon.ico` | App icon. |
+
+## License
+
+MIT — see [LICENSE](LICENSE). Free to use, modify, and distribute.
