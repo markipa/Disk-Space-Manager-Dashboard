@@ -37,6 +37,8 @@ hiddenimports += [
     "pythonnet", "clr", "clr_loader", "webview.platforms.edgechromium",
     "win32gui", "win32ui", "win32con", "pywintypes",
     "PIL.Image",
+    # local package split out of file_dashboard.py
+    "dsd", "dsd.utils", "dsd.icons", "dsd.figures", "dsd.analysis",
 ]
 
 a = Analysis(
